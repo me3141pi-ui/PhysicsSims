@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Auto-Running Stable Fluids</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; display: flex; justify-content: center; align-items: center; height: 100vh; }
+        canvas { box-shadow: 0 0 30px #333; }
+    </style>
+</head>
+<body>
+    <canvas id="simCanvas" width="600" height="600"></canvas>
+
+<script>
+    /* STABLE FLUIDS (Jos Stam) - AUTO RUNNING VERSION
+       Includes: Advection, Diffusion, Projection (Mass Conservation)
+    */
+
+    // --- SETTINGS ---
+    const N = 128;         // Grid resolution (higher = slower but detailed)
+    const ITER = 10;       // Solver accuracy
+    const SCALE = 4;       // Display scaling (sim grid vs pixel size)
+    const DT = 0.1;        // Time step
+    const DIFF = 0.0001;   // Diffusion rate
+    const VISC = 0.0001;   // Viscosity rate
+
+    // Grid size (N+2 accounts for boundaries)
+    const size = (N + 2) * (N + 2);
+
+    // Arrays
+    let u = new Float32Array(size);       // Velocity X
+    let v = new Float32Array(size);       // Velocity Y
+    let u_prev = new Float32Array(size);
+    let v_prev = new Float32Array(size);
+    let dens = new Float32Array(size);    // Density (Smoke)
+    let dens_prev = new Float32Array(size);
+
+    // Canvas Setup
+    const canvas = document.getElementById('simCanvas');
+    const ctx = canvas.getContext('2d');
+
+    // Ensure canvas matches grid aspect ratio
+    canvas.width = N * SCALE;
+    canvas.height = N * SCALE;
+
+    // Image buffer for fast rendering
+    const imgData = ctx.createImageData(canvas.width, canvas.height);
+
+
+    // --- MATH & SOLVER FUNCTIONS ---
+
+    // 1D Index from 2D coordinates
+    function IX(x, y) {
+        return x + (N + 2) * y;
+    }
+
+    // Add source (density or velocity)
+    function add_source(x, s, dt) {
+        for (let i = 0; i < size; i++) x[i] += dt * s[i];
+    }
+
+    // Linear Solver (Gauss-Seidel) - The "Stable" part
+    function lin_solve(b, x, x0, a, c) {
+        const cRecip = 1.0 / c;
+        for (let k = 0; k < ITER; k++) {
+            for (let j = 1; j <= N; j++) {
+                for (let i = 1; i <= N; i++) {
+                    x[IX(i, j)] = (x0[IX(i, j)] + a * (x[IX(i - 1, j)] + x[IX(i + 1, j)] + x[IX(i, j - 1)] + x[IX(i, j + 1)])) * cRecip;
+                }
+            }
+            set_bnd(b, x);
+        }
+    }
+
+    // Diffusion
+    function diffuse(b, x, x0, diff, dt) {
+        const a = dt * diff * (N * N);
+        lin_solve(b, x, x0, a, 1 + 6 * a);
+    }
+
+    // Advection (Semi-Lagrangian Backtracing)
+    function advect(b, d, d0, u, v, dt) {
+        let i0, j0, i1, j1;
+        let x, y, s0, t0, s1, t1, dt0;
+
+        dt0 = dt * N;
+        for (let i = 1; i <= N; i++) {
+            for (let j = 1; j <= N; j++) {
+                x = i - dt0 * u[IX(i, j)];
+                y = j - dt0 * v[IX(i, j)];
+
+                if (x < 0.5) x = 0.5; if (x > N + 0.5) x = N + 0.5;
+                i0 = Math.floor(x); i1 = i0 + 1;
+
+                if (y < 0.5) y = 0.5; if (y > N + 0.5) y = N + 0.5;
+                j0 = Math.floor(y); j1 = j0 + 1;
+
+                s1 = x - i0; s0 = 1.0 - s1;
+                t1 = y - j0; t0 = 1.0 - t1;
+
+                d[IX(i, j)] =
+                    s0 * (t0 * d0[IX(i0, j0)] + t1 * d0[IX(i0, j1)]) +
+                    s1 * (t0 * d0[IX(i1, j0)] + t1 * d0[IX(i1, j1)]);
+            }
+        }
+        set_bnd(b, d);
+    }
+
+    // Projection (Makes fluid incompressible)
+    function project(u, v, p, div) {
+        const h = 1.0 / N;
+        for (let j = 1; j <= N; j++) {
+            for (let i = 1; i <= N; i++) {
+                div[IX(i, j)] = -0.5 * h * (u[IX(i + 1, j)] - u[IX(i - 1, j)] + v[IX(i, j + 1)] - v[IX(i, j - 1)]);
+                p[IX(i, j)] = 0;
+            }
+        }
+        set_bnd(0, div);
+        set_bnd(0, p);
+
+        lin_solve(0, p, div, 1, 4);
+
+        for (let j = 1; j <= N; j++) {
+            for (let i = 1; i <= N; i++) {
+                u[IX(i, j)] -= 0.5 * (p[IX(i + 1, j)] - p[IX(i - 1, j)]) / h;
+                v[IX(i, j)] -= 0.5 * (p[IX(i, j + 1)] - p[IX(i, j - 1)]) / h;
+            }
+        }
+        set_bnd(1, u);
+        set_bnd(2, v);
+    }
+
+    // Boundary conditions
+    function set_bnd(b, x) {
+        for (let i = 1; i <= N; i++) {
+            x[IX(0, i)] = b === 1 ? -x[IX(1, i)] : x[IX(1, i)];
+            x[IX(N + 1, i)] = b === 1 ? -x[IX(N, i)] : x[IX(N, i)];
+            x[IX(i, 0)] = b === 2 ? -x[IX(i, 1)] : x[IX(i, 1)];
+            x[IX(i, N + 1)] = b === 2 ? -x[IX(i, N)] : x[IX(i, N)];
+        }
+        x[IX(0, 0)] = 0.5 * (x[IX(1, 0)] + x[IX(0, 1)]);
+        x[IX(0, N + 1)] = 0.5 * (x[IX(1, N + 1)] + x[IX(0, N)]);
+        x[IX(N + 1, 0)] = 0.5 * (x[IX(N, 0)] + x[IX(N + 1, 1)]);
+        x[IX(N + 1, N + 1)] = 0.5 * (x[IX(N, N + 1)] + x[IX(N + 1, N)]);
+    }
+
+    // --- MAIN LOOP ---
+
+    function step() {
+        // Velocity Step
+        diffuse(1, u_prev, u, VISC, DT);
+        diffuse(2, v_prev, v, VISC, DT);
+        project(u_prev, v_prev, u, v);
+        advect(1, u, u_prev, u_prev, v_prev, DT);
+        advect(2, v, v_prev, u_prev, v_prev, DT);
+        project(u, v, u_prev, v_prev);
+
+        // Density Step
+        diffuse(0, dens_prev, dens, DIFF, DT);
+        advect(0, dens, dens_prev, u, v, DT);
+    }
+
+    let time = 0;
+
+    function autoInject() {
+        // Calculate a moving source position (Oscillating circle)
+        time += 0.05;
+        const centerX = N / 2;
+        const centerY = N / 2;
+        const radius = N / 4;
+
+        const sourceX = centerX + Math.cos(time) * radius;
+        const sourceY = centerY + Math.sin(time * 1.5) * radius; // 1.5 makes it a Lissajous-ish figure
+
+        // Convert to integer grid coords
+        const i = Math.floor(sourceX);
+        const j = Math.floor(sourceY);
+
+        // Add Density (Smoke)
+        dens[IX(i, j)] += 100; // Strong source
+        // Add density to neighbors for a thicker stream
+        dens[IX(i+1, j)] += 50;
+        dens[IX(i-1, j)] += 50;
+        dens[IX(i, j+1)] += 50;
+        dens[IX(i, j-1)] += 50;
+
+        // Add Velocity (Direction of movement)
+        // Move velocity in direction of the tangent + some noise
+        const force = 5.0;
+        u[IX(i, j)] += -Math.sin(time) * force;
+        v[IX(i, j)] += Math.cos(time * 1.5) * force;
+    }
+
+    function render() {
+        // High-performance rendering using ImageData
+        const data = imgData.data;
+
+        for (let j = 0; j < canvas.height; j++) {
+            for (let i = 0; i < canvas.width; i++) {
+                // Map pixel coordinate to grid coordinate
+                const gi = Math.floor(i / SCALE) + 1;
+                const gj = Math.floor(j / SCALE) + 1;
+
+                const d = dens[IX(gi, gj)];
+
+                // Visualization: Map density to Color (Blue/Purple/White fire)
+                const index = (i + j * canvas.width) * 4;
+
+                // Color mapping logic
+                // R, G, B, Alpha
+                data[index]     = Math.min(255, d * 150); // Red
+                data[index + 1] = Math.min(255, d * 200); // Green
+                data[index + 2] = Math.min(255, d * 255 + 50); // Blue base
+                data[index + 3] = 255; // Alpha
+            }
+        }
+        ctx.putImageData(imgData, 0, 0);
+    }
+
+    function loop() {
+        autoInject(); // Inject "stuff" automatically
+        step();       // Solve physics
+        render();     // Draw
+        requestAnimationFrame(loop);
+    }
+
+    // Start
+    loop();
+
+</script>
+</body>
+</html>
